@@ -1,0 +1,1 @@
+open_api_key = "Your api key" #replace your api key here
