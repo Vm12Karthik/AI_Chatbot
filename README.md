@@ -1,6 +1,6 @@
 #Chatbot
 
-Get your OpenAI API key here - https://beta.openai.com/account/api-keys
+Get your OpenAI API key here - https://platform.openai.com/account/api-keys
 
 Replace that key in the config.py code
 
