@@ -1,9 +1,8 @@
-
-# Option 1 (Recommended): Use an environment variable for safety
 import os
 
-OPENAI_API_KEY = "Your API Key"
+OPENAI_API_KEY = "OPENAI_API_KEY" # if you use OpenAI
+GROQ_API_KEY   =  "Your groq API" # if you use GroqAI
 
-# Option 2: Directly set your OpenAI API key here (less secure)
-if not OPENAI_API_KEY:
-    raise ValueError("❌ OpenAI API key not found! Please set it in your environment or directly in config.py")
+if not GROQ_API_KEY and not OPENAI_API_KEY:
+    raise ValueError("Set GROQ_API_KEY (or OPENAI_API_KEY).")
+
