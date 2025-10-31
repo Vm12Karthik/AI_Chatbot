@@ -4,7 +4,8 @@ import os
 import streamlit as st
 import sqlite3
 from openai import OpenAI
-from config import OPENAI_API_KEY
+from groq import Groq
+from config import OPENAI_API_KEY, GROQ_API_KEY
 
 # Optional PDF extraction
 try:
@@ -13,101 +14,146 @@ try:
 except Exception:
     _HAS_PYPDF2 = False
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ---- LLM provider helpers ----------------------------------------------------
+def get_provider_client(provider: str):
+    """
+    Lazily import and build the right client for the selected provider.
+    Returns (client, model_name, err_msg_if_any).
+    """
+    provider = provider.lower()
+    if provider == "openai":
+        if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith("sk-"):
+            return None, None, "OpenAI key missing/invalid. Set OPENAI_API_KEY (starts with 'sk-')."
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            # Pick a sensible/chatty, affordable model
+            return client, "gpt-3.5-turbo", None
+            # You can switch to "gpt-4o-mini" or others anytime.
+        except Exception as e:
+            return None, None, f"Failed to init OpenAI client: {e}"
+
+    # default: Groq
+    if not GROQ_API_KEY or not GROQ_API_KEY.startswith("gsk_"):
+        return None, None, "Groq key missing/invalid. Set GROQ_API_KEY (starts with 'gsk_')."
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        return client, "llama-3.1-8b-instant", None  # or "llama-3.1-70b-versatile"
+    except Exception as e:
+        return None, None, f"Failed to init Groq client: {e}"
+
+def llm_chat(provider: str, client, model: str, messages, max_tokens=300, temperature=0.7):
+    """
+    Unified chat call for OpenAI & Groq (both expose client.chat.completions.create).
+    Returns answer string or raises Exception.
+    """
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    # Both SDKs return choices[0].message.content
+    return resp.choices[0].message.content.strip()
+
+# ---- App folders -------------------------------------------------------------
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- DATABASE ----------------
 DB_PATH = "users.db"
 
+# ---- DB helpers --------------------------------------------------------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def create_users_table():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)")
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)")
+        conn.commit()
 
 def insert_user(username, password):
-    conn = get_conn()
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO users VALUES (?, ?)", (username, password))
-        conn.commit()
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO users VALUES (?, ?)", (username, password))
+            conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False
-    finally:
-        conn.close()
 
 def user_exists(username, password):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
-    res = c.fetchone()
-    conn.close()
-    return res is not None
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM users WHERE username=? AND password=?", (username, password))
+        return c.fetchone() is not None
 
-# --- Chat history DB helpers ---
 def create_chat_table():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            user_text TEXT,
-            attachment_summary TEXT,
-            bot_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                user_text TEXT,
+                attachment_summary TEXT,
+                bot_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
 
 def save_chat_to_db(username, user_text, attachment_summary, bot_text):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO chats (username, user_text, attachment_summary, bot_text) VALUES (?, ?, ?, ?)",
-              (username, user_text, attachment_summary, bot_text))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO chats (username, user_text, attachment_summary, bot_text) VALUES (?, ?, ?, ?)",
+                  (username, user_text, attachment_summary, bot_text))
+        conn.commit()
 
 def load_chats_for_user(username, limit=200):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT user_text, attachment_summary, bot_text FROM chats WHERE username=? ORDER BY id ASC LIMIT ?",
-              (username, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT user_text, attachment_summary, bot_text
+                     FROM chats WHERE username=? ORDER BY id ASC LIMIT ?""",
+                  (username, limit))
+        return c.fetchall()
 
-# init tables
+# ---- Init DB -----------------------------------------------------------------
 create_users_table()
 create_chat_table()
 
-# ---------------- SESSION ----------------
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "username" not in st.session_state:
-    st.session_state.username = ""
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# ---- Session defaults --------------------------------------------------------
+if "logged_in" not in st.session_state: st.session_state.logged_in = False
+if "username"  not in st.session_state: st.session_state.username  = ""
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
+if "provider" not in st.session_state: st.session_state.provider = "Groq"  # default free option
 
-# ---------------- UI ----------------
+# ---- UI ----------------------------------------------------------------------
 st.set_page_config(page_title="AI Assistant Chatbot", page_icon="🤖", layout="centered")
 
-# Sidebar
+# Sidebar branding
 if os.path.exists("image.png"):
     st.sidebar.image("image.png", use_container_width=True)
 else:
     st.sidebar.markdown("### 🤖 AI Chatbot")
 
+# Provider switch
+st.sidebar.markdown("#### Model Provider")
+provider_choice = st.sidebar.radio("Choose provider:", ["Groq", "OpenAI"], index=0 if st.session_state.provider=="Groq" else 1)
+st.session_state.provider = provider_choice
+
+# Provider status
+client, default_model, init_err = get_provider_client(st.session_state.provider)
+if init_err:
+    st.sidebar.error(init_err)
+else:
+    st.sidebar.success(f"{st.session_state.provider} ready ✓ (model: {default_model})")
+
+st.sidebar.markdown("---")
 st.sidebar.header("User Panel")
 
-# If logged in: show username & logout
+# Auth area
 if st.session_state.logged_in:
     st.sidebar.markdown(f"**Logged in as:** `{st.session_state.username}`")
     if st.sidebar.button("Logout"):
@@ -115,9 +161,7 @@ if st.session_state.logged_in:
         st.session_state.username = ""
         st.session_state.chat_history = []
         st.rerun()
-
 else:
-    # Register
     st.sidebar.subheader("Register")
     reg_user = st.sidebar.text_input("Username", key="reg_user")
     reg_pass = st.sidebar.text_input("Password", type="password", key="reg_pass")
@@ -134,7 +178,6 @@ else:
             st.sidebar.error("❌ Username exists. Try login.")
 
     st.sidebar.markdown("---")
-    # Login
     st.sidebar.subheader("Login")
     log_user = st.sidebar.text_input("Username", key="login_user")
     log_pass = st.sidebar.text_input("Password", type="password", key="login_pass")
@@ -148,17 +191,19 @@ else:
         else:
             st.sidebar.error("❌ Invalid credentials.")
 
-# ---------------- MAIN ----------------
+# ---- Main --------------------------------------------------------------------
 st.title("🤖 Smart AI Chatbot")
-st.write("Ask anything — general questions, coding doubts, productivity help, ideas, knowledge… \n\nYou can also upload files!")
+st.write("Ask anything — coding, study help, brainstorming, tasks. You can also upload files (images/PDF/TXT).")
 
 if st.session_state.logged_in:
+
+    # File upload
     uploaded_file = st.file_uploader("Attach file (optional)", type=["png", "jpg", "jpeg", "pdf", "txt", "md"])
     attached_summary = ""
     if uploaded_file:
-        path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-        with open(path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        path = os.path.join("uploads", uploaded_file.name)
+        with open(path, "wb") as f: f.write(uploaded_file.getbuffer())
+
         if uploaded_file.type.startswith("image/"):
             st.image(path, caption=uploaded_file.name, use_container_width=True)
             attached_summary = f"[Image attached: {uploaded_file.name}]"
@@ -182,40 +227,43 @@ if st.session_state.logged_in:
             else:
                 attached_summary = f"[PDF attached: {uploaded_file.name}]"
 
+    # Chat box
     user_input = st.text_area("You:", height=120)
     if st.button("Send"):
         if not user_input.strip():
             st.warning("Please type a message.")
+        elif init_err:
+            st.error(init_err)
         else:
             with st.spinner("Thinking..."):
                 content = user_input.strip()
                 if attached_summary:
                     content += "\n\n" + attached_summary
+
                 msgs = [
-                    {"role": "system", "content": "You are a friendly, general-purpose AI assistant. Help with any topic politely and clearly."},
+                    {"role": "system",
+                     "content": "You are a friendly, general-purpose AI assistant. Be concise, clear, and helpful."},
                     {"role": "user", "content": content}
                 ]
+
                 try:
-                    resp = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=msgs,
-                        max_tokens=300,
-                        temperature=0.7
-                    )
-                    answer = resp.choices[0].message.content.strip()
+                    # One call that works for both OpenAI & Groq clients
+                    answer = llm_chat(st.session_state.provider, client, default_model, msgs,
+                                      max_tokens=300, temperature=0.7)
                 except Exception as e:
-                    if "insufficient_quota" in str(e) or "429" in str(e):
-                        st.warning("⚠️ No OpenAI credits — using offline response.")
-                        answer = ("I am currently offline. Try again later or add API credits. "
-                                  "Meanwhile, general tip: stay curious and keep learning! 🚀")
+                    # Distinguish quota/invalid key where possible; otherwise generic.
+                    e_msg = str(e)
+                    if "insufficient_quota" in e_msg or "quota" in e_msg or "401" in e_msg:
+                        st.warning("⚠️ Provider rejected the request (invalid key or no credits).")
                     else:
                         st.error(f"⚠️ API error: {e}")
-                        answer = "Error reaching AI service."
-                
+                    answer = "I'm unable to reach the AI service right now. Please check the selected provider & API key."
+
+                # Save & show
                 st.session_state.chat_history.append((user_input.strip(), attached_summary, answer))
                 save_chat_to_db(st.session_state.username, user_input.strip(), attached_summary, answer)
 
-    # Display history
+    # History
     if st.session_state.chat_history:
         st.markdown("### 💬 Chat History")
         for u, a, b in st.session_state.chat_history:
@@ -229,5 +277,6 @@ else:
     st.info("Please login or register to start chatting.")
 
 st.markdown("<hr>", unsafe_allow_html=True)
-st.caption("🤖 AI Chatbot © 2025 | Built with Streamlit & OpenAI GPT-3.5")
+st.caption("🤖 AI Chatbot © 2025 | OpenAI & Groq compatible")
+
 
